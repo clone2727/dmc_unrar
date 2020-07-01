@@ -570,6 +570,11 @@ const char *dmc_unrar_strerror(dmc_unrar_return code);
 /** Initialize an IO structure. */
 bool dmc_unrar_io_init(dmc_unrar_io *io, dmc_unrar_io_handler *handler, void *opaque);
 
+#if DMC_UNRAR_DISABLE_STDIO != 1
+/** Initialize an IO structure from a FILE*. */
+bool dmc_unrar_io_init_from_file(dmc_unrar_io *io, FILE *file, bool *allocated_new_opaque);
+#endif
+
 /** Close an IO structure. */
 void dmc_unrar_io_close(dmc_unrar_io *io);
 
@@ -1775,6 +1780,51 @@ bool dmc_unrar_io_init(dmc_unrar_io *io, dmc_unrar_io_handler *handler, void *op
 	return true;
 }
 
+#if DMC_UNRAR_DISABLE_STDIO != 1
+bool dmc_unrar_io_init_from_file(dmc_unrar_io *io, FILE *file, bool *allocated_new_opaque) {
+	*allocated_new_opaque = false;
+
+#if DMC_UNRAR_DISABLE_WIN32 == 1
+	return dmc_unrar_io_init(io, &dmc_unrar_io_stdio_handler, file);
+#else
+	{
+		int fd;
+		HANDLE orig_handle, dup_handle, current_process;
+		BOOL result;
+
+		fd = _fileno(file);
+		if (fd == -1 || fd == -2)
+			return false;
+
+		orig_handle = _get_osfhandle(fd);
+		if (orig_handle == INVALID_HANDLE_VALUE || orig_handle == (HANDLE)-2)
+			return false;
+
+		current_process = GetCurrentProcess();
+
+		result = DuplicateHandle(
+			current_process,
+			orig_handle,
+			current_process,
+			&dup_handle,
+			0,
+			FALSE,
+			DUPLICATE_SAME_ACCESS);
+		if (result == 0)
+			return false;
+
+		if (!dmc_unrar_io_init(io, dmc_unrar_io_win32_handler, dup_handle)) {
+			CloseHandle(dup_handle);
+			return false;
+		}
+
+		*allocated_new_opaque = true;
+		return true;
+	}
+#endif /* DMC_UNRAR_DISABLE_WIN32 */
+}
+#endif /* DMC_UNRAR_DISABLE_STDIO */
+
 void dmc_unrar_io_close(dmc_unrar_io *io) {
 	DMC_UNRAR_ASSERT(io);
 	io->funcs->close(io->opaque);
@@ -1821,13 +1871,17 @@ bool dmc_unrar_is_rar_mem(const void *mem, size_t size) {
 #if DMC_UNRAR_DISABLE_STDIO != 1
 bool dmc_unrar_is_rar_file(FILE *file) {
 	dmc_unrar_io io;
+	bool close_io, result;
 
-	if (!file)
+	if (!file || !dmc_unrar_io_init_from_file(&io, file, &close_io))
 		return false;
 
-	dmc_unrar_io_init(&io, &dmc_unrar_io_stdio_handler, file);
+	result = dmc_unrar_is_rar(&io);
 
-	return dmc_unrar_is_rar(&io);
+	if (close_io)
+		dmc_unrar_io_close(&io);
+
+	return result;
 }
 #endif /* DMC_UNRAR_DISABLE_STDIO */
 
@@ -1966,14 +2020,19 @@ dmc_unrar_return dmc_unrar_archive_open_mem(dmc_unrar_archive *archive,
 
 #if DMC_UNRAR_DISABLE_STDIO != 1
 dmc_unrar_return dmc_unrar_archive_open_file(dmc_unrar_archive *archive, FILE *file) {
+	bool close_file_early;
+
 	/* Sanity checks. */
 	if (!archive)
 		return DMC_UNRAR_ARCHIVE_IS_NULL;
 	if (!file)
 		return DMC_UNRAR_ARCHIVE_EMPTY;
 
-	if (!dmc_unrar_io_init(&archive->io, &dmc_unrar_io_stdio_handler, file))
+	if (!dmc_unrar_io_init_from_file(&archive->io, file, &close_file_early))
 		return DMC_UNRAR_SEEK_FAIL;
+
+	if (close_file_early)
+		fclose(file);
 
 	/* Initialize allocators. */
 	{
